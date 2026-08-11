@@ -1,0 +1,10 @@
+[project]
+name = "vurtualtshirt"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "mediapipe>=1.0.0",
+    "opencv-python>=5.0.0.93",
+    "pyvirtualcam>=0.15.0",
+]
