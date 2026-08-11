@@ -24,44 +24,29 @@ MODEL_PATH = Path(__file__).parent / "models" / "pose_landmarker_lite.task"
 SHIRT_COLOR = (60, 60, 190)  # BGR — тёмно-красная футболка
 
 # Индексы точек позы (PoseLandmarker), см. официальную схему MediaPipe Pose.
+NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
-LEFT_HIP, RIGHT_HIP = 23, 24
-LEFT_EAR, RIGHT_EAR = 7, 8
+
+# Где проводить линию горловины между носом и плечами: 0 = на уровне носа
+# (закроет и шею), 1 = на уровне плеч (может оставить голую шею/грудь).
+NECKLINE_RATIO = 0.7
 
 
-def build_torso_mask(frame_shape, landmarks, pad_ratio=0.18):
-    """Полигон футболки: от плеч вниз до низа кадра, с запасом по бокам."""
+def build_shirt_mask(frame_shape, landmarks, person_mask):
+    """Всё тело человека ниже линии горловины — по реальному силуэту,
+    а не по нарисованному контуру, чтобы футболка точно закрывала торс
+    целиком (руки, бока, живот) без пробелов."""
     h, w = frame_shape[:2]
 
-    def pt(idx):
-        lm = landmarks[idx]
-        return np.array([lm.x * w, lm.y * h])
+    nose_y = landmarks[NOSE].y * h
+    shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2 * h
 
-    l_sh, r_sh = pt(LEFT_SHOULDER), pt(RIGHT_SHOULDER)
-    l_hip, r_hip = pt(LEFT_HIP), pt(RIGHT_HIP)
-    l_ear, r_ear = pt(LEFT_EAR), pt(RIGHT_EAR)
+    neckline_y = int(round(nose_y + (shoulder_y - nose_y) * NECKLINE_RATIO))
+    neckline_y = max(0, min(h, neckline_y))
 
-    shoulder_w = np.linalg.norm(l_sh - r_sh)
-    pad = shoulder_w * pad_ratio
-
-    neck_l = l_sh + (l_ear - l_sh) * 0.35
-    neck_r = r_sh + (r_ear - r_sh) * 0.35
-
-    l_sleeve = l_sh + np.array([pad * 1.6, -pad * 0.2])
-    r_sleeve = r_sh + np.array([-pad * 1.6, -pad * 0.2])
-
-    bottom_y = min(h - 1, max(l_hip[1], r_hip[1]) + shoulder_w * 0.9)
-    l_bottom = np.array([l_hip[0] - pad, bottom_y])
-    r_bottom = np.array([r_hip[0] + pad, bottom_y])
-
-    polygon = np.array(
-        [neck_l, l_sleeve, l_sh, l_bottom, r_bottom, r_sh, r_sleeve, neck_r],
-        dtype=np.int32,
-    )
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], 255)
-    return mask
+    band = np.zeros((h, w), dtype=np.uint8)
+    band[neckline_y:, :] = 255
+    return cv2.bitwise_and(band, person_mask)
 
 
 def main():
@@ -120,18 +105,12 @@ def main():
 
             out = frame
 
-            if result.pose_landmarks:
+            if result.pose_landmarks and result.segmentation_masks:
                 landmarks = result.pose_landmarks[0]
-                torso = build_torso_mask(frame.shape, landmarks)
-
-                if result.segmentation_masks:
-                    person_mask = (
-                        result.segmentation_masks[0].numpy_view() > 0.4
-                    ).astype(np.uint8) * 255
-                    shirt_mask = cv2.bitwise_and(torso, person_mask)
-                else:
-                    shirt_mask = torso
-
+                person_mask = (
+                    result.segmentation_masks[0].numpy_view() > 0.4
+                ).astype(np.uint8) * 255
+                shirt_mask = build_shirt_mask(frame.shape, landmarks, person_mask)
                 shirt_mask = cv2.GaussianBlur(shirt_mask, (15, 15), 0)
 
                 if shirt_mask_smooth is None:
