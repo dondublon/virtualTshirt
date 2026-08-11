@@ -69,12 +69,21 @@ def main():
         help="Пересчитывать позу/маску раз в N кадров, между ними — переиспользовать",
     )
     parser.add_argument("--debug", action="store_true", help="Показать окно предпросмотра")
+    parser.add_argument(
+        "--passthrough",
+        action="store_true",
+        help="Без MediaPipe: просто прогнать кадры камеры в виртуальную камеру (для поиска bottleneck)",
+    )
     args = parser.parse_args()
 
     if not MODEL_PATH.exists():
         raise SystemExit(f"Не найдена модель позы: {MODEL_PATH}")
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
+    # Многие камеры (в т.ч. Brio 100) в несжатом YUYV режут fps до 5 на
+    # разрешениях от 720p и выше — запрашиваем MJPG, где то же разрешение
+    # спокойно тянет 30 fps.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_FPS, args.fps)
@@ -90,32 +99,41 @@ def main():
     proc_w = min(args.proc_width, w)
     proc_h = round(h * proc_w / w)
 
-    options = vision.PoseLandmarkerOptions(
-        base_options=mp_base_options.BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-        output_segmentation_masks=True,
-    )
-    landmarker = vision.PoseLandmarker.create_from_options(options)
+    landmarker = None
+    if not args.passthrough:
+        options = vision.PoseLandmarkerOptions(
+            base_options=mp_base_options.BaseOptions(model_asset_path=str(MODEL_PATH)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_segmentation_masks=True,
+        )
+        landmarker = vision.PoseLandmarker.create_from_options(options)
+
+    # Слой цвета футболки считаем один раз: пересоздавать его в каждом
+    # кадре (np.full_like) неожиданно дорого и было главным bottleneck'ом.
+    shirt_layer = np.full((h, w, 3), SHIRT_COLOR, dtype=np.uint8)
 
     shirt_mask_smooth = None
     shirt_mask_raw = None  # маска в полном разрешении, живёт между пересчётами
     smoothing = 0.5  # 0 = без сглаживания, ближе к 1 = сильнее сглаживание
     start_time = time.monotonic()
     frame_idx = 0
+    fps_counter = 0
+    fps_window_start = time.monotonic()
 
     with pyvirtualcam.Camera(
         width=w, height=h, fps=args.fps, device=args.output, fmt=pyvirtualcam.PixelFormat.BGR
     ) as cam:
-        print(f"Виртуальная камера запущена: {cam.device} ({w}x{h}@{args.fps})")
+        mode = "passthrough (без обработки)" if args.passthrough else "с футболкой"
+        print(f"Виртуальная камера запущена: {cam.device} ({w}x{h}@{args.fps}), режим: {mode}")
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
 
-            if frame_idx % args.detect_every == 0:
+            if not args.passthrough and frame_idx % args.detect_every == 0:
                 proc_frame = (
                     cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
                     if (proc_w, proc_h) != (w, h)
@@ -154,12 +172,12 @@ def main():
                         + (1 - smoothing) * shirt_mask.astype(np.float32)
                     )
 
-                alpha = (shirt_mask_smooth / 255.0)[..., None]
-                shirt_layer = np.full_like(frame, SHIRT_COLOR, dtype=np.uint8)
-                out = (
-                    frame.astype(np.float32) * (1 - alpha)
-                    + shirt_layer.astype(np.float32) * alpha
-                ).astype(np.uint8)
+                # Целочисленный блендинг через cv2 вместо float32-арифметики
+                # в NumPy — на порядок быстрее на полном разрешении кадра.
+                mask3 = cv2.cvtColor(shirt_mask_smooth.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                fg = cv2.multiply(shirt_layer, mask3, scale=1 / 255)
+                bg = cv2.multiply(frame, cv2.bitwise_not(mask3), scale=1 / 255)
+                out = cv2.add(fg, bg)
             else:
                 shirt_mask_smooth = None
 
@@ -171,7 +189,15 @@ def main():
             cam.send(out)
             cam.sleep_until_next_frame()
 
-    landmarker.close()
+            fps_counter += 1
+            now = time.monotonic()
+            if now - fps_window_start >= 2.0:
+                print(f"~{fps_counter / (now - fps_window_start):.1f} fps")
+                fps_counter = 0
+                fps_window_start = now
+
+    if landmarker is not None:
+        landmarker.close()
     cap.release()
     if args.debug:
         cv2.destroyAllWindows()
