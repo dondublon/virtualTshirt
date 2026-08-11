@@ -31,12 +31,20 @@ LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 # (закроет и шею), 1 = на уровне плеч (может оставить голую шею/грудь).
 NECKLINE_RATIO = 0.7
 
+# Насколько раздвигать границы футболки наружу (во все стороны, включая
+# верх) относительно ширины плеч — запас, чтобы силуэт сегментации не
+# обрезал футболку впритык по контуру тела.
+BORDER_EXPAND_RATIO = 0.05
+
 
 def build_shirt_mask(frame_shape, landmarks, person_mask):
     """Всё тело человека ниже линии горловины — по реальному силуэту,
     а не по нарисованному контуру, чтобы футболка точно закрывала торс
     целиком (руки, бока, живот) без пробелов."""
     h, w = frame_shape[:2]
+
+    l_sh_x, r_sh_x = landmarks[LEFT_SHOULDER].x * w, landmarks[RIGHT_SHOULDER].x * w
+    shoulder_w = abs(l_sh_x - r_sh_x)
 
     nose_y = landmarks[NOSE].y * h
     shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2 * h
@@ -46,7 +54,11 @@ def build_shirt_mask(frame_shape, landmarks, person_mask):
 
     band = np.zeros((h, w), dtype=np.uint8)
     band[neckline_y:, :] = 255
-    return cv2.bitwise_and(band, person_mask)
+    mask = cv2.bitwise_and(band, person_mask)
+
+    margin = max(1, round(shoulder_w * BORDER_EXPAND_RATIO))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
+    return cv2.dilate(mask, kernel)
 
 
 def main():

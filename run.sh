@@ -1,1 +1,1 @@
- uv run main.py --camera 2 --output /dev/video10 --detect-every=10
+ uv run main.py --camera 2 --output /dev/video10
