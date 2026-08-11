@@ -1,0 +1,1 @@
+ uv run main.py --camera 2 --output /dev/video10
