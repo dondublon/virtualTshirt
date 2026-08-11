@@ -21,7 +21,7 @@ from mediapipe.tasks.python.core import base_options as mp_base_options
 
 MODEL_PATH = Path(__file__).parent / "models" / "pose_landmarker_lite.task"
 
-SHIRT_COLOR = (60, 60, 190)  # BGR — тёмно-красная футболка
+SHIRT_COLOR = (105, 100, 95)  # BGR — неброский серый
 
 # Индексы точек позы (PoseLandmarker), см. официальную схему MediaPipe Pose.
 NOSE = 0
@@ -56,6 +56,18 @@ def main():
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--proc-width",
+        type=int,
+        default=480,
+        help="Ширина кадра, на котором считается поза/сегментация (меньше — быстрее)",
+    )
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=2,
+        help="Пересчитывать позу/маску раз в N кадров, между ними — переиспользовать",
+    )
     parser.add_argument("--debug", action="store_true", help="Показать окно предпросмотра")
     args = parser.parse_args()
 
@@ -75,6 +87,9 @@ def main():
         raise SystemExit("Камера открылась, но кадр прочитать не удалось")
     h, w = frame.shape[:2]
 
+    proc_w = min(args.proc_width, w)
+    proc_h = round(h * proc_w / w)
+
     options = vision.PoseLandmarkerOptions(
         base_options=mp_base_options.BaseOptions(model_asset_path=str(MODEL_PATH)),
         running_mode=vision.RunningMode.VIDEO,
@@ -86,8 +101,10 @@ def main():
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
     shirt_mask_smooth = None
+    shirt_mask_raw = None  # маска в полном разрешении, живёт между пересчётами
     smoothing = 0.5  # 0 = без сглаживания, ближе к 1 = сильнее сглаживание
     start_time = time.monotonic()
+    frame_idx = 0
 
     with pyvirtualcam.Camera(
         width=w, height=h, fps=args.fps, device=args.output, fmt=pyvirtualcam.PixelFormat.BGR
@@ -98,20 +115,36 @@ def main():
             if not ok:
                 break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.monotonic() - start_time) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            if frame_idx % args.detect_every == 0:
+                proc_frame = (
+                    cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+                    if (proc_w, proc_h) != (w, h)
+                    else frame
+                )
+                rgb = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int((time.monotonic() - start_time) * 1000)
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
+                if result.pose_landmarks and result.segmentation_masks:
+                    landmarks = result.pose_landmarks[0]
+                    person_mask_small = (
+                        result.segmentation_masks[0].numpy_view() > 0.4
+                    ).astype(np.uint8) * 255
+                    shirt_mask_small = build_shirt_mask(
+                        (proc_h, proc_w), landmarks, person_mask_small
+                    )
+                    shirt_mask_raw = cv2.resize(
+                        shirt_mask_small, (w, h), interpolation=cv2.INTER_LINEAR
+                    )
+                else:
+                    shirt_mask_raw = None
+
+            frame_idx += 1
             out = frame
 
-            if result.pose_landmarks and result.segmentation_masks:
-                landmarks = result.pose_landmarks[0]
-                person_mask = (
-                    result.segmentation_masks[0].numpy_view() > 0.4
-                ).astype(np.uint8) * 255
-                shirt_mask = build_shirt_mask(frame.shape, landmarks, person_mask)
-                shirt_mask = cv2.GaussianBlur(shirt_mask, (15, 15), 0)
+            if shirt_mask_raw is not None:
+                shirt_mask = cv2.GaussianBlur(shirt_mask_raw, (15, 15), 0)
 
                 if shirt_mask_smooth is None:
                     shirt_mask_smooth = shirt_mask.astype(np.float32)
