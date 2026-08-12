@@ -27,9 +27,14 @@ SHIRT_COLOR = (105, 100, 95)  # BGR — неброский серый
 NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 
-# Где проводить линию горловины между носом и плечами: 0 = на уровне носа
-# (закроет и шею), 1 = на уровне плеч (может оставить голую шею/грудь).
+# Где проводить линию горловины между носом и плечами (по бокам, у плеч):
+# 0 = на уровне носа (закроет и шею), 1 = на уровне плеч.
 NECKLINE_RATIO = 0.7
+
+# Вырез горловины по центру (под подбородком), как у обычной футболки:
+# ширина выреза и его глубина вниз (от боковой линии), в долях ширины плеч.
+NOTCH_WIDTH_RATIO = 0.45
+NOTCH_DEPTH_RATIO = 0.2
 
 # Насколько раздвигать границы футболки наружу (во все стороны, включая
 # верх) относительно ширины плеч — запас, чтобы силуэт сегментации не
@@ -40,20 +45,29 @@ BORDER_EXPAND_RATIO = 0.05
 def build_shirt_mask(frame_shape, landmarks, person_mask):
     """Всё тело человека ниже линии горловины — по реальному силуэту,
     а не по нарисованному контуру, чтобы футболка точно закрывала торс
-    целиком (руки, бока, живот) без пробелов."""
+    целиком (руки, бока, живот) без пробелов. Верхняя граница — почти
+    горизонтальная линия по плечам с вырезом-выемкой по центру под
+    подбородком, как у обычного круглого выреза футболки."""
     h, w = frame_shape[:2]
 
     l_sh_x, r_sh_x = landmarks[LEFT_SHOULDER].x * w, landmarks[RIGHT_SHOULDER].x * w
     shoulder_w = abs(l_sh_x - r_sh_x)
 
+    nose_x = landmarks[NOSE].x * w
     nose_y = landmarks[NOSE].y * h
     shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2 * h
 
-    neckline_y = int(round(nose_y + (shoulder_y - nose_y) * NECKLINE_RATIO))
-    neckline_y = max(0, min(h, neckline_y))
+    neckline_y = nose_y + (shoulder_y - nose_y) * NECKLINE_RATIO
 
-    band = np.zeros((h, w), dtype=np.uint8)
-    band[neckline_y:, :] = 255
+    notch_half_width = max(1.0, shoulder_w * NOTCH_WIDTH_RATIO / 2)
+    notch_depth = shoulder_w * NOTCH_DEPTH_RATIO
+
+    cols = np.arange(w, dtype=np.float32)
+    bump = np.clip(1.0 - ((cols - nose_x) / notch_half_width) ** 2, 0.0, 1.0)
+    cutoff = np.clip(neckline_y + notch_depth * bump, 0, h)
+
+    rows = np.arange(h, dtype=np.float32)[:, None]
+    band = (rows >= cutoff[None, :]).astype(np.uint8) * 255
     mask = cv2.bitwise_and(band, person_mask)
 
     margin = max(1, round(shoulder_w * BORDER_EXPAND_RATIO))
