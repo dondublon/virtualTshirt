@@ -80,6 +80,12 @@ def main():
         default=2,
         help="Пересчитывать позу/маску раз в N кадров, между ними — переиспользовать",
     )
+    parser.add_argument(
+        "--smoothing",
+        type=float,
+        default=0.75,
+        help="Сглаживание контура во времени: 0 = выкл, ближе к 1 = меньше дрожания, но больше лаг",
+    )
     parser.add_argument("--debug", action="store_true", help="Показать окно предпросмотра")
     parser.add_argument(
         "--passthrough",
@@ -129,7 +135,7 @@ def main():
 
     shirt_mask_smooth = None
     shirt_mask_raw = None  # маска в полном разрешении, живёт между пересчётами
-    smoothing = 0.5  # 0 = без сглаживания, ближе к 1 = сильнее сглаживание
+    smoothing = args.smoothing
     start_time = time.monotonic()
     frame_idx = 0
     fps_counter = 0
@@ -174,7 +180,7 @@ def main():
             out = frame
 
             if shirt_mask_raw is not None:
-                shirt_mask = cv2.GaussianBlur(shirt_mask_raw, (15, 15), 0)
+                shirt_mask = cv2.GaussianBlur(shirt_mask_raw, (25, 25), 0)
 
                 if shirt_mask_smooth is None:
                     shirt_mask_smooth = shirt_mask.astype(np.float32)
