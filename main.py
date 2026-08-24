@@ -10,6 +10,7 @@ Virtual T-shirt: закрывает голый торс на веб-камере
 
 import argparse
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -113,7 +114,16 @@ def main():
         "--smoothing",
         type=float,
         default=0.75,
-        help="Сглаживание контура во времени: 0 = выкл, ближе к 1 = меньше дрожания, но больше лаг",
+        help="Сглаживание точек градиента во времени: 0 = выкл, ближе к 1 = меньше дрожания",
+    )
+    parser.add_argument(
+        "--stability-window",
+        type=float,
+        default=2.0,
+        help=(
+            "Контур футболки = объединение (ИЛИ) всех силуэтов за последние N секунд: "
+            "точка остаётся закрашенной, если её закрашивало хотя бы раз за это время"
+        ),
     )
     parser.add_argument("--debug", action="store_true", help="Показать окно предпросмотра")
     parser.add_argument(
@@ -158,7 +168,12 @@ def main():
         )
         landmarker = vision.PoseLandmarker.create_from_options(options)
 
-    shirt_mask_smooth = None
+    # История силуэтов за последние --stability-window секунд (в уменьшенном
+    # разрешении, как считает детекция). "Показываемый" контур — объединение
+    # (логическое ИЛИ) всех них: точка закрашена, если её закрасило хотя бы
+    # одно "текущее" распознавание за это время — так мелкое покадровое
+    # дрожание не долетает до итоговой картинки.
+    mask_history = deque()
     shirt_mask_raw = None  # маска в полном разрешении, живёт между пересчётами
     # x-координаты плеч (мин/макс по кадру, не привязаны к анатомическому
     # left/right) — точки градиента. Сглаживаются отдельно от маски: это
@@ -193,6 +208,7 @@ def main():
                 timestamp_ms = int((time.monotonic() - start_time) * 1000)
                 result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
+                now_t = time.monotonic()
                 if result.pose_landmarks and result.segmentation_masks:
                     landmarks = result.pose_landmarks[0]
                     person_mask_small = (
@@ -201,11 +217,16 @@ def main():
                     shirt_mask_small = build_shirt_mask(
                         (proc_h, proc_w), landmarks, person_mask_small
                     )
-                    shirt_mask_raw = cv2.resize(
-                        shirt_mask_small, (w, h), interpolation=cv2.INTER_LINEAR
-                    )
+                    mask_history.append((now_t, shirt_mask_small))
                     l_x, r_x = landmarks[LEFT_SHOULDER].x * w, landmarks[RIGHT_SHOULDER].x * w
                     shoulder_x_raw = (min(l_x, r_x), max(l_x, r_x))
+
+                while mask_history and now_t - mask_history[0][0] > args.stability_window:
+                    mask_history.popleft()
+
+                if mask_history:
+                    union_small = np.stack([m for _, m in mask_history]).max(axis=0)
+                    shirt_mask_raw = cv2.resize(union_small, (w, h), interpolation=cv2.INTER_LINEAR)
                 else:
                     shirt_mask_raw = None
                     shoulder_x_raw = None
@@ -216,14 +237,9 @@ def main():
             if shirt_mask_raw is not None and shoulder_x_raw is not None:
                 shirt_mask = cv2.GaussianBlur(shirt_mask_raw, (25, 25), 0)
 
-                if shirt_mask_smooth is None:
-                    shirt_mask_smooth = shirt_mask.astype(np.float32)
+                if shoulder_x_smooth is None:
                     shoulder_x_smooth = shoulder_x_raw
                 else:
-                    shirt_mask_smooth = (
-                        smoothing * shirt_mask_smooth
-                        + (1 - smoothing) * shirt_mask.astype(np.float32)
-                    )
                     shoulder_x_smooth = (
                         smoothing * shoulder_x_smooth[0] + (1 - smoothing) * shoulder_x_raw[0],
                         smoothing * shoulder_x_smooth[1] + (1 - smoothing) * shoulder_x_raw[1],
@@ -236,12 +252,11 @@ def main():
 
                 # Целочисленный блендинг через cv2 вместо float32-арифметики
                 # в NumPy — на порядок быстрее на полном разрешении кадра.
-                mask3 = cv2.cvtColor(shirt_mask_smooth.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+                mask3 = cv2.cvtColor(shirt_mask, cv2.COLOR_GRAY2BGR)
                 fg = cv2.multiply(shirt_layer, mask3, scale=1 / 255)
                 bg = cv2.multiply(frame, cv2.bitwise_not(mask3), scale=1 / 255)
                 out = cv2.add(fg, bg)
             else:
-                shirt_mask_smooth = None
                 shoulder_x_smooth = None
 
             if args.debug:
