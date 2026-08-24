@@ -21,7 +21,9 @@ from mediapipe.tasks.python.core import base_options as mp_base_options
 
 MODEL_PATH = Path(__file__).parent / "models" / "pose_landmarker_lite.task"
 
-SHIRT_COLOR = (105, 100, 95)  # BGR — неброский серый
+# BGR — градиент слева направо: тёмно-серый -> светло-серый.
+SHIRT_COLOR_DARK = (60, 60, 60)
+SHIRT_COLOR_LIGHT = (195, 195, 195)
 
 # Индексы точек позы (PoseLandmarker), см. официальную схему MediaPipe Pose.
 NOSE = 0
@@ -33,8 +35,8 @@ NECKLINE_RATIO = 0.7
 
 # Вырез горловины по центру (под подбородком), как у обычной футболки:
 # ширина выреза и его глубина вниз (от боковой линии), в долях ширины плеч.
-NOTCH_WIDTH_RATIO = 0.45
-NOTCH_DEPTH_RATIO = 0.2
+NOTCH_WIDTH_RATIO = 0.5
+NOTCH_DEPTH_RATIO = 0.3
 
 # Насколько раздвигать границы футболки наружу (во все стороны, включая
 # верх) относительно ширины плеч — запас, чтобы силуэт сегментации не
@@ -73,6 +75,19 @@ def build_shirt_mask(frame_shape, landmarks, person_mask):
     margin = max(1, round(shoulder_w * BORDER_EXPAND_RATIO))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
     return cv2.dilate(mask, kernel)
+
+
+def make_gradient_layer(w, h, x_min, x_max, color_dark, color_light):
+    """Горизонтальный градиент шириной w, растянутый на всю высоту h.
+    x_min/x_max — точки в пикселях кадра, где градиент достигает чистого
+    тёмного/светлого цвета (для нас — сглаженные x-координаты плеч)."""
+    xs = np.arange(w, dtype=np.float32)
+    span = max(1.0, x_max - x_min)
+    t = np.clip((xs - x_min) / span, 0.0, 1.0)[:, None]
+    dark = np.array(color_dark, dtype=np.float32)
+    light = np.array(color_light, dtype=np.float32)
+    row = (dark * (1 - t) + light * t).astype(np.uint8).reshape(1, w, 3)
+    return cv2.resize(row, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
 def main():
@@ -143,12 +158,14 @@ def main():
         )
         landmarker = vision.PoseLandmarker.create_from_options(options)
 
-    # Слой цвета футболки считаем один раз: пересоздавать его в каждом
-    # кадре (np.full_like) неожиданно дорого и было главным bottleneck'ом.
-    shirt_layer = np.full((h, w, 3), SHIRT_COLOR, dtype=np.uint8)
-
     shirt_mask_smooth = None
     shirt_mask_raw = None  # маска в полном разрешении, живёт между пересчётами
+    # x-координаты плеч (мин/макс по кадру, не привязаны к анатомическому
+    # left/right) — точки градиента. Сглаживаются отдельно от маски: это
+    # всего два числа, поэтому сглаживание почти не даёт лага, зато сильно
+    # гасит дрожание границ градиента.
+    shoulder_x_raw = None
+    shoulder_x_smooth = None
     smoothing = args.smoothing
     start_time = time.monotonic()
     frame_idx = 0
@@ -187,22 +204,35 @@ def main():
                     shirt_mask_raw = cv2.resize(
                         shirt_mask_small, (w, h), interpolation=cv2.INTER_LINEAR
                     )
+                    l_x, r_x = landmarks[LEFT_SHOULDER].x * w, landmarks[RIGHT_SHOULDER].x * w
+                    shoulder_x_raw = (min(l_x, r_x), max(l_x, r_x))
                 else:
                     shirt_mask_raw = None
+                    shoulder_x_raw = None
 
             frame_idx += 1
             out = frame
 
-            if shirt_mask_raw is not None:
+            if shirt_mask_raw is not None and shoulder_x_raw is not None:
                 shirt_mask = cv2.GaussianBlur(shirt_mask_raw, (25, 25), 0)
 
                 if shirt_mask_smooth is None:
                     shirt_mask_smooth = shirt_mask.astype(np.float32)
+                    shoulder_x_smooth = shoulder_x_raw
                 else:
                     shirt_mask_smooth = (
                         smoothing * shirt_mask_smooth
                         + (1 - smoothing) * shirt_mask.astype(np.float32)
                     )
+                    shoulder_x_smooth = (
+                        smoothing * shoulder_x_smooth[0] + (1 - smoothing) * shoulder_x_raw[0],
+                        smoothing * shoulder_x_smooth[1] + (1 - smoothing) * shoulder_x_raw[1],
+                    )
+
+                shirt_layer = make_gradient_layer(
+                    w, h, shoulder_x_smooth[0], shoulder_x_smooth[1],
+                    SHIRT_COLOR_DARK, SHIRT_COLOR_LIGHT,
+                )
 
                 # Целочисленный блендинг через cv2 вместо float32-арифметики
                 # в NumPy — на порядок быстрее на полном разрешении кадра.
@@ -212,6 +242,7 @@ def main():
                 out = cv2.add(fg, bg)
             else:
                 shirt_mask_smooth = None
+                shoulder_x_smooth = None
 
             if args.debug:
                 cv2.imshow("preview", out)
